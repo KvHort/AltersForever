@@ -81,6 +81,24 @@ Simplified and Traditional Chinese.
 Put the `AltersForever` folder in `World of Warcraft\_classic_beta_\Interface\AddOns\`
 and restart the game. Made for Forever 1.60.1 (`Interface: 16001`).
 
+## Development
+
+Run `tests/check.sh` before a commit. It needs `lua5.1`, `luac5.1` and
+`luacheck` (on Ubuntu: `sudo apt install lua5.1 lua-check`). It does three
+things:
+
+- compiles every file with Lua 5.1, which has the same limits as the game:
+  200 locals in the main chunk and 60 upvalues in each function. The main
+  file is close to the first limit, so new code goes into tables such as
+  `mailbox`, `custom` or `guildBank` instead of new top-level locals;
+- runs luacheck with `.luacheckrc`. An unknown global is usually a typo or a
+  local used before its definition. Add a WoW API name to the list only when
+  the code needs it;
+- runs `tests/harness.lua`, which loads the addon against a mocked game API
+  and goes through login, the mailbox, sent mail, auctions and every tab.
+
+The harness does not replace a test in the game.
+
 ## License
 
 MIT
