@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.34
+
+- Mail tab: every letter of every character, the one that expires first at the top, with who sent it, what it carries, its gold or cash on delivery, and when it expires. Search by sender, subject or item. Click a letter to open the character's mail.
+- The Mail filter on the character page lists its letters one by one instead of item slots.
+- Inboxes with more than 50 letters: the letters the game does not show yet are counted too.
+- New mail is noticed before you open the mailbox, from the game's new mail notice.
+- Auctions that sold or ended become expected letters on their character, even while it is logged out. Ended auctions move their item from Auction to Mail.
+- Mail you send or return to one of your characters shows up on it as an expected letter, with its items and gold. Cash on delivery letters expire after 3 days.
+- Mail warnings come again during the session, and once more when less than a day is left. A red letter icon next to the name in Characters shows mail about to expire, a blue one new mail. The Mail and Cooldowns tabs show how many need a look.
+- The minimap button tooltip shows your characters and gold, mail about to expire, new mail and ready cooldowns.
+- Notes: Shift-right click a character, or the Note button on its page. The note shows in its tooltip and on its page.
+- Realm and faction filters under the character list. They also apply to tooltips and search.
+- Options, "Tabs, sections and filters": hide tabs or change their order, and hide sections of the character page (talents, legacy, skills and so on).
+- `/alts mail` and `/alts customize`.
+
 ## 1.33
 
 - Legacy trees are drawn right again. A patch changed the spacing between their talents, and some ended up in the wrong row or column.

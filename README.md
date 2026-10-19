@@ -34,11 +34,23 @@ materials and how many of them that character has. You can search recipes by
 name or by material. Recipe items in tooltips say who already knows them, who
 can learn them and who still needs more skill.
 
+Mail lists every letter of every character, the one that expires first at the
+top: who sent it, what it carries, its gold or cash on delivery and when it
+expires. Mail you send or return to your own characters, and auctions that sold
+or ended, show up as expected letters (marked with ~) until that character opens
+its mailbox. A red letter next to a name means mail about to expire, a blue one
+new mail.
+
 Cooldowns collects profession cooldowns (transmutes, mooncloth and the like)
 from all your characters and tells you in chat when one is ready.
 
 Columns can be sorted by clicking their header. Characters you don't want to
-see can be hidden with a right click, without deleting anything.
+see can be hidden with a right click, without deleting anything. Shift-right
+click writes a note. The buttons under the list show only this realm or this
+faction.
+
+Options, "Tabs, sections and filters", hides tabs you don't use, changes their
+order and hides sections of the character page.
 
 By default the window uses the Forever look: dark glass with bronze lines and
 gold highlights. The Blizzard theme gives it the game's own frames and buttons,
@@ -54,6 +66,8 @@ every colour lives in `Themes.lua` if you want to make your own.
 | `/alts button` | Show or hide the minimap button |
 | `/alts theme horde` | Change the colours (`forever`, `blizzard`, `green`, `blue`, `purple`, `grey`, `classic`, `alliance`, `horde`) |
 | `/alts scale 1.2` | Window size, from 0.6 to 1.6 |
+| `/alts mail` | Open the Mail tab |
+| `/alts customize` | Tabs, sections, filters and mail options |
 
 `/af` and `/alters` work the same as `/alts`.
 

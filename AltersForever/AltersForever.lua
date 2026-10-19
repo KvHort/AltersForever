@@ -27,11 +27,19 @@ local OPTIONS = {
     tooltipTotalOnly = false,
     tooltipShift = false,
     bgAlpha     = 1,
+    mailMarker  = true,
+    mailFromAuctions = true,
+    onlyRealm   = false,
+    onlyFaction = false,
+    tabOrder    = { "Characters", "Mail", "Professions", "Cooldowns", "Guild", "Search", "Options" },
 }
 
-local DATA_VERSION = 2
-local MAIL_DAYS = 30
-local MAIL_WARNING_DAYS = 3
+local DATA_VERSION = 3
+
+-- correo carta a carta; en una tabla, no caben mas locales (limite de 200)
+local mailbox = { DAYS = 30, COD_DAYS = 3, WARNING_DAYS = 3, AH_CUT = 0.05, warned = {} }
+-- pestanas, secciones, filtros, notas y resumen
+local custom = {}
 
 local MIN_SCALE, MAX_SCALE = 0.6, 1.6
 
@@ -120,10 +128,19 @@ local function Duration(seconds)
     return format(L["%dm"], math.floor(seconds / 60))
 end
 
+-- filtros de reino y faccion; el pj actual siempre pasa
+function custom.Allowed(c)
+    local options = db.options
+    if c == me then return true end
+    if options.onlyRealm and c.realm and me.realm and c.realm ~= me.realm then return false end
+    if options.onlyFaction and c.faction and me.faction and c.faction ~= me.faction then return false end
+    return true
+end
+
 local function SortedChars()
     local list = {}
     for _, c in pairs(db.chars) do
-        if not c.hidden or db.options.showHidden then
+        if (not c.hidden or db.options.showHidden) and custom.Allowed(c) then
             table.insert(list, c)
         end
     end
@@ -469,27 +486,59 @@ local function ScanWorn()
     end
 end
 
-local function ScanMail()
-    local counts, soonest, gold = {}, nil, 0
-    local letters = GetInboxNumItems()
-    for i = 1, letters do
-        local _, _, _, _, money, _, daysLeft, hasItem = GetInboxHeaderInfo(i)
-        gold = gold + (money or 0)
-        if hasItem or (money or 0) > 0 then
-            soonest = math.min(soonest or daysLeft, daysLeft)
+-- correo: cada carta con remitente, asunto, objetos, oro, reembolso y caducidad
+-- c.mail, mailLetters, mailMoney y mailExpires salen de las cartas, para tooltips y busqueda
+function mailbox.Summarize(c)
+    if not c.letters then return end
+    local counts, gold, soonest = {}, 0, nil
+    for _, letter in ipairs(c.letters) do
+        gold = gold + (letter.money or 0)
+        for _, item in ipairs(letter.items or {}) do
+            counts[item[1]] = (counts[item[1]] or 0) + item[2]
         end
-        for a = 1, ATTACHMENTS_MAX_RECEIVE or 16 do
-            local _, itemID, _, count = GetInboxItem(i, a)
-            if itemID then
-                counts[itemID] = (counts[itemID] or 0) + (count or 1)
-                Remember(itemID, GetInboxItemLink(i, a))
-            end
+        -- solo las que pierden algo al caducar
+        if letter.items or (letter.money or 0) > 0 then
+            soonest = math.min(soonest or letter.expires, letter.expires)
         end
     end
-    me.mail = counts
-    me.mailLetters = letters
-    me.mailMoney = gold
-    me.mailExpires = soonest and (time() + soonest * 86400) or nil
+    c.mail, c.mailMoney, c.mailExpires = counts, gold, soonest
+    c.mailLetters = #c.letters + (c.mailHidden or 0)
+end
+
+local function InboxItems(index)
+    local items
+    for a = 1, ATTACHMENTS_MAX_RECEIVE or 16 do
+        local _, itemID, _, count = GetInboxItem(index, a)
+        if itemID then
+            local link = GetInboxItemLink(index, a)
+            items = items or {}
+            table.insert(items, { itemID, count or 1, link })
+            Remember(itemID, link)
+        end
+    end
+    return items
+end
+
+-- el buzon solo ensena 50; el resto llega al borrar o vaciar cartas
+local function ScanMail()
+    local shown, total = GetInboxNumItems()
+    local letters, now = {}, time()
+    for i = 1, shown do
+        local _, _, sender, subject, money, cod, daysLeft, hasItem, _, returned = GetInboxHeaderInfo(i)
+        table.insert(letters, {
+            from = sender, subject = subject, money = money or 0, cod = cod or 0,
+            expires = now + math.floor((daysLeft or 0) * 86400),
+            returned = returned and true or nil,
+            items = hasItem and InboxItems(i) or nil,
+        })
+    end
+    me.letters = letters
+    me.mailHidden = math.max((total or shown) - shown, 0)
+    me.mailSeen = now
+    me.newMail = nil
+    -- lo que acabo en la casa de subastas ya esta en este buzon
+    mailbox.MarkAuctions(me)
+    mailbox.Summarize(me)
 end
 
 local function FindAlt(name)
@@ -504,46 +553,63 @@ local function FindAlt(name)
     end
 end
 
--- se apunta al enviarse; el buzon del alt lo corrige
-local function Deliver(c, items, money)
-    c.mail = c.mail or {}
-    for id, count in pairs(items) do
-        c.mail[id] = (c.mail[id] or 0) + count
-    end
-    c.mailLetters = (c.mailLetters or 0) + 1
-    c.mailMoney = (c.mailMoney or 0) + (money or 0)
-    local expires = time() + MAIL_DAYS * 86400
-    c.mailExpires = math.min(c.mailExpires or expires, expires)
+-- se apunta al enviarse como carta esperada; el buzon del alt la corrige
+function mailbox.Deliver(c, letter)
+    c.letters = c.letters or {}
+    table.insert(c.letters, letter)
+    c.newMail = true
+    mailbox.Summarize(c)
 end
 
-local outgoing
-
-local function WatchMail()
-    hooksecurefunc("SendMail", function(recipient)
+function mailbox.Watch()
+    hooksecurefunc("SendMail", function(recipient, subject)
         local c = FindAlt(recipient)
-        if not c then outgoing = nil return end
-        local items = {}
+        if not c then mailbox.outgoing = nil return end
+        local items
         for a = 1, ATTACHMENTS_MAX_SEND or 12 do
             local _, itemID, _, count = GetSendMailItem(a)
             if itemID then
-                items[itemID] = (items[itemID] or 0) + (count or 1)
-                Remember(itemID, GetSendMailItemLink(a))
+                local link = GetSendMailItemLink(a)
+                items = items or {}
+                table.insert(items, { itemID, count or 1, link })
+                Remember(itemID, link)
             end
         end
-        outgoing = { c = c, items = items, money = GetSendMailMoney() }
+        local cod = GetSendMailCOD and GetSendMailCOD() or 0
+        local now = time()
+        mailbox.outgoing = { c = c, letter = {
+            from = me.name, subject = subject, money = GetSendMailMoney() or 0, cod = cod, items = items,
+            expires = now + (cod > 0 and mailbox.COD_DAYS or mailbox.DAYS) * 86400, expected = "sent", at = now,
+        } }
     end)
 
+    -- devuelta a uno de los tuyos: le llega sin reembolso y con 30 dias
     hooksecurefunc("ReturnInboxItem", function(index)
-        local _, _, sender, _, money = GetInboxHeaderInfo(index)
+        local _, _, sender, subject, money = GetInboxHeaderInfo(index)
         local c = FindAlt(sender)
         if not c then return end
-        local items = {}
-        for a = 1, ATTACHMENTS_MAX_RECEIVE or 16 do
-            local _, itemID, _, count = GetInboxItem(index, a)
-            if itemID then items[itemID] = (items[itemID] or 0) + (count or 1) end
-        end
-        Deliver(c, items, money)
+        local now = time()
+        mailbox.Deliver(c, {
+            from = me.name, subject = subject, money = money or 0, cod = 0, items = InboxItems(index),
+            expires = now + mailbox.DAYS * 86400, returned = true, expected = "returned", at = now,
+        })
     end)
+end
+
+-- datos de antes de 1.34: sin cartas, solo totales; quedan como una carta antigua
+function mailbox.Upgrade(c)
+    if c.letters or (c.mailLetters or 0) == 0 then return end
+    local items
+    for id, count in pairs(c.mail or {}) do
+        items = items or {}
+        table.insert(items, { id, count })
+    end
+    c.letters = { {
+        from = "?", money = c.mailMoney or 0, cod = 0, items = items,
+        expires = c.mailExpires or (time() + mailbox.DAYS * 86400), expected = "old",
+    } }
+    c.mailHidden = math.max(c.mailLetters - 1, 0)
+    mailbox.Summarize(c)
 end
 
 -- una vez por espera
@@ -609,7 +675,9 @@ local function ScanAuctions()
             db.names[id] = db.names[id] or C_Item.GetItemNameByID(id)
         end
     end
+    mailbox.CarryMarks(me.auctions, list)
     me.auctions, me.ah, me.auctionsSeen = list, counts, time()
+    mailbox.CheckAuctions(me)
 end
 
 local function ScanBids()
@@ -652,18 +720,99 @@ local function WarnAuctions()
     end
 end
 
-local function WarnMail()
-    if not db.options.mailWarning then return end
-    for _, c in pairs(db.chars) do
-        local left = c.mailExpires and c.mailExpires - time()
-        if left and (c.mailLetters or 0) > 0 and left < MAIL_WARNING_DAYS * 86400 then
-            if left > 0 then
-                Say("%s has mail that expires in %s.", ClassColored(c), Duration(left))
-            else
-                Say("%s had mail that may have expired.", ClassColored(c))
+-- subasta -> carta: [7] marca la subasta que ya dio su carta
+
+-- las vendidas siguen en la lista en la siguiente lectura: conservan la marca
+function mailbox.CarryMarks(old, list)
+    local marked = {}
+    for _, auction in ipairs(old or {}) do
+        if auction[6] and auction[7] then table.insert(marked, auction) end
+    end
+    for _, auction in ipairs(list) do
+        if auction[6] then
+            for i, other in ipairs(marked) do
+                if other[1] == auction[1] and other[3] == auction[3] and other[4] == auction[4] then
+                    auction[7] = true
+                    table.remove(marked, i)
+                    break
+                end
             end
         end
     end
+end
+
+function mailbox.MarkAuctions(c)
+    local now = time()
+    for _, auction in ipairs(c.auctions or {}) do
+        if auction[6] or auction[5] <= now then auction[7] = true end
+    end
+end
+
+-- vendida: llega el oro; acabada sin verla vendida: vuelve el objeto, o el oro si se vendio
+-- el tiempo guardado es el maximo del tramo, asi que pasado ese tiempo seguro que acabo
+function mailbox.CheckAuctions(c)
+    if not db.options.mailFromAuctions then return end
+    local now, changed = time(), false
+    for _, auction in ipairs(c.auctions or {}) do
+        if not auction[7] and (auction[6] or auction[5] <= now) then
+            auction[7] = true
+            local id, link, count, price = auction[1], auction[2], auction[3], auction[4]
+            local name = (link and link:match("%[(.-)%]")) or db.names[id] or C_Item.GetItemNameByID(id) or ("item:" .. id)
+            local letter = { from = L["Auction House"], cod = 0, money = 0,
+                expires = now + mailbox.DAYS * 86400, expected = "auction", at = now }
+            if auction[6] then
+                letter.subject = format(L["Sold: %s"], name)
+                letter.money = math.floor(price * count * (1 - mailbox.AH_CUT))
+                letter.estimate = true
+            else
+                letter.subject = format(L["Ended: %s"], name)
+                letter.items = { { id, count, link } }
+                letter.maybeSold = true
+                -- ya no esta en la casa de subastas
+                if c.ah and c.ah[id] then
+                    c.ah[id] = c.ah[id] - count
+                    if c.ah[id] <= 0 then c.ah[id] = nil end
+                end
+            end
+            c.letters = c.letters or {}
+            table.insert(c.letters, letter)
+            c.newMail = true
+            changed = true
+        end
+    end
+    if changed then mailbox.Summarize(c) end
+end
+
+-- "expiring" si caduca algo en menos de 3 dias, "new" si hay carta nueva
+function mailbox.State(c)
+    local left = c.mailExpires and c.mailExpires - time()
+    if left and (c.mailLetters or 0) > 0 and left < mailbox.WARNING_DAYS * 86400 then return "expiring", left end
+    if c.newMail then return "new" end
+end
+
+-- una vez por sesion, y otra cuando queda menos de un dia
+function mailbox.Warn()
+    if not db.options.mailWarning then return end
+    for _, c in pairs(db.chars) do
+        local state, left = mailbox.State(c)
+        if state == "expiring" then
+            local key = c.mailExpires .. (left < 86400 and "!" or "")
+            if mailbox.warned[c] ~= key then
+                mailbox.warned[c] = key
+                if left > 0 then
+                    Say("%s has mail that expires in %s.", ClassColored(c), Duration(left))
+                else
+                    Say("%s had mail that may have expired.", ClassColored(c))
+                end
+            end
+        end
+    end
+end
+
+function mailbox.Tick()
+    for _, c in pairs(db.chars) do mailbox.CheckAuctions(c) end
+    mailbox.Warn()
+    RefreshWindow()
 end
 
 -- ranuras: 1-2 principales, 3 cocina, 4 pesca, 5 primeros auxilios
@@ -1217,6 +1366,7 @@ local function ScanPlayer()
     me.name = UnitName("player")
     me.realm = GetRealmName()
     me.className, me.class = UnitClass("player")
+    me.faction = UnitFactionGroup("player")
     me.race = UnitRace("player")
     me.level = UnitLevel("player")
     me.guild = GetGuildInfo("player")
@@ -1755,6 +1905,7 @@ local function CharacterTooltip(c)
         GameTooltip:AddDoubleLine(L["Experience"], format("%d / %d (%d%%)", c.xp or 0, c.xpMax, progress * 100), 1, 0.82, 0, 1, 1, 1)
     end
     if c.guild then GameTooltip:AddLine("<" .. c.guild .. ">", 0.6, 1, 0.6) end
+    if c.note then GameTooltip:AddLine(c.note, 1, 0.82, 0, true) end
     GameTooltip:AddLine(" ")
     if c.bagSlots then
         GameTooltip:AddDoubleLine(L["Free bag slots"], format("%d / %d", c.bagFree, c.bagSlots), 1, 0.82, 0, 1, 1, 1)
@@ -1766,15 +1917,18 @@ local function CharacterTooltip(c)
     end
     if c.mailLetters and c.mailLetters > 0 then
         local left = L["no hurry"]
+        local state = mailbox.State(c)
         if c.mailExpires then
             local seconds = c.mailExpires - time()
             left = seconds > 0 and format(L["expires in %s"], Duration(seconds)) or L["expired"]
+            if state == "expiring" then left = "|cffff5050" .. left .. "|r" end
         end
         GameTooltip:AddDoubleLine(format(L["Mail: %d"], c.mailLetters), left, 1, 0.82, 0, 1, 1, 1)
         if (c.mailMoney or 0) > 0 then
             GameTooltip:AddDoubleLine(L["Gold in mail"], Money(c.mailMoney), 1, 0.82, 0, 1, 1, 1)
         end
     end
+    if c.newMail then GameTooltip:AddLine(L["New mail since the last mailbox visit"], 0.5, 0.75, 1) end
     if c.goldWeek and c.goldWeek == WeekStart() then
         GameTooltip:AddDoubleLine(L["Gold today"], MoneyChange(GoldToday(c)), 1, 0.82, 0, 1, 1, 1)
         GameTooltip:AddDoubleLine(L["Gold this week"], MoneyChange(GoldWeek(c)), 1, 0.82, 0, 1, 1, 1)
@@ -1785,6 +1939,7 @@ local function CharacterTooltip(c)
     GameTooltip:AddLine(" ")
     GameTooltip:AddLine(L["Left click: open the character"], 0.6, 0.6, 0.6)
     GameTooltip:AddLine(L["Right click: hide or forget this character"], 0.6, 0.6, 0.6)
+    GameTooltip:AddLine(L["Shift-right click: write a note"], 0.6, 0.6, 0.6)
 end
 
 local function RestedText(c)
@@ -1802,8 +1957,17 @@ local function SeenText(c)
     return c == me and L["now"] or Duration(time() - (c.lastSeen or time()))
 end
 
+-- carta roja: algo caduca pronto; azul: correo nuevo
+function mailbox.Marker(c)
+    if not db.options.mailMarker then return "" end
+    local state = mailbox.State(c)
+    if state == "expiring" then return " |TInterface\\Icons\\INV_Letter_15:13:13:0:0:64:64:5:59:5:59:255:90:90|t" end
+    if state == "new" then return " |TInterface\\Icons\\INV_Letter_15:13:13:0:0:64:64:5:59:5:59:120:180:255|t" end
+    return ""
+end
+
 local function FillCharacter(cells, c)
-    cells.name:SetText(ClassIcon(c) .. ClassColored(c) .. (c.hidden and (" |cff808080" .. L["(hidden)"] .. "|r") or ""))
+    cells.name:SetText(ClassIcon(c) .. ClassColored(c) .. mailbox.Marker(c) .. (c.hidden and (" |cff808080" .. L["(hidden)"] .. "|r") or ""))
     cells.level:SetText(LevelText(c))
     cells.zone:SetText(c.zone or "")
     cells.money:SetText(Money(c.money))
@@ -1838,6 +2002,46 @@ CharacterDialog("ALTERSFOREVER_HIDE", L["Hide %s from the lists and tooltips? No
 CharacterDialog("ALTERSFOREVER_SHOW", L["Show %s again?"], L["Show"], true)
 CharacterDialog("ALTERSFOREVER_HIDE_ME", L["Hide %s from the lists and tooltips? Nothing is deleted."], L["Hide"], false)
 CharacterDialog("ALTERSFOREVER_SHOW_ME", L["Show %s again?"], L["Show"], false)
+
+-- notas: se ven en el tooltip y en la ficha
+function custom.PopupBox(dialog)
+    return dialog.editBox or (dialog.GetEditBox and dialog:GetEditBox())
+end
+
+StaticPopupDialogs.ALTERSFOREVER_NOTE = {
+    text = L["Note for %s:"],
+    button1 = ACCEPT or OKAY,
+    button2 = CANCEL,
+    hasEditBox = 1,
+    maxLetters = 200,
+    editBoxWidth = 280,
+    OnShow = function(self, c)
+        c = c or self.data
+        local box = custom.PopupBox(self)
+        box:SetText(c and c.note or "")
+        box:HighlightText()
+    end,
+    OnAccept = function(self, c)
+        c = c or self.data
+        if not c then return end
+        local text = strtrim(custom.PopupBox(self):GetText() or "")
+        c.note = text ~= "" and text or nil
+        RefreshWindow()
+    end,
+    EditBoxOnEnterPressed = function(self, c)
+        local dialog = self:GetParent()
+        StaticPopupDialogs.ALTERSFOREVER_NOTE.OnAccept(dialog, c)
+        dialog:Hide()
+    end,
+    EditBoxOnEscapePressed = function(self) self:GetParent():Hide() end,
+    timeout = 0,
+    whileDead = true,
+    hideOnEscape = true,
+}
+
+function custom.EditNote(c)
+    StaticPopup_Show("ALTERSFOREVER_NOTE", c.name, nil, c)
+end
 
 StaticPopupDialogs.ALTERSFOREVER_FORGET = {
     text = L["Forget the saved data of %s?"],
@@ -2433,8 +2637,85 @@ local SECTIONS = {
     { "statistics", "Statistics", "Interface\\Icons\\INV_Scroll_03" },
 }
 
+-- secciones que se pueden quitar de la ficha; Objetos siempre esta
+for i = 2, #SECTIONS do OPTIONS["showSection" .. SECTIONS[i][1]] = true end
+
+function custom.LayoutSections(page, anchor)
+    local previous
+    for i, btn in ipairs(page.sectionButtons) do
+        local shown = i == 1 or db.options["showSection" .. btn.key]
+        btn:SetShown(shown)
+        if shown then
+            btn:ClearAllPoints()
+            if previous then
+                btn:SetPoint("LEFT", previous, "RIGHT", 4, 0)
+            else
+                btn:SetPoint("LEFT", anchor, "RIGHT", 10, 2)
+            end
+            previous = btn
+        elseif window.section == btn.key then
+            window.section = "items"
+        end
+    end
+end
+
+-- una carta en una linea: el primer objeto, o el asunto si no trae objetos
+function mailbox.Contents(letter)
+    local prefix = letter.returned and ("|cffff9933" .. L["Returned"] .. ":|r ") or ""
+    local first = letter.items and letter.items[1]
+    if not first then return prefix .. (letter.subject or "") end
+    local id, count, link = first[1], first[2], first[3]
+    local name = (link and link:match("%[(.-)%]")) or ItemName(id) or ("item:" .. id)
+    local text = format("|T%s:14:14|t %s%s", C_Item.GetItemIconByID(id) or 134400, QualityColored(id, name), count > 1 and (" x" .. count) or "")
+    if #letter.items > 1 then text = text .. " |cff999999" .. format(L["+%d more"], #letter.items - 1) .. "|r" end
+    return prefix .. text
+end
+
+function mailbox.MoneyText(letter)
+    if (letter.cod or 0) > 0 then return "|cffff5050" .. L["COD"] .. "|r " .. Money(letter.cod) end
+    if (letter.money or 0) > 0 then return (letter.estimate and "~" or "") .. Money(letter.money) end
+    return ""
+end
+
+function mailbox.ExpiresText(letter)
+    local left = letter.expires - time()
+    if left <= 0 then return "|cff999999" .. L["expired"] .. "|r" end
+    local text = (letter.expected and "~" or "") .. Duration(left)
+    if left < mailbox.WARNING_DAYS * 86400 and (letter.items or (letter.money or 0) > 0) then
+        return "|cffff5050" .. text .. "|r"
+    end
+    return text
+end
+
+function mailbox.Sorted(c)
+    local letters = {}
+    for _, letter in ipairs(c.letters or {}) do table.insert(letters, letter) end
+    table.sort(letters, function(a, b) return a.expires < b.expires end)
+    return letters
+end
+
+-- en la ficha, con el filtro Correo
+function mailbox.Rows(c)
+    local rows = {}
+    if not c.letters then return rows end
+    local seen = c.mailSeen and ("  |cff999999" .. format(L["(seen %s ago)"], Duration(time() - c.mailSeen)) .. "|r") or ""
+    table.insert(rows, { header = L["Letters"] .. seen })
+    for _, letter in ipairs(mailbox.Sorted(c)) do
+        local from = letter.expected and ("|cff999999" .. (letter.from or "?") .. "|r") or (letter.from or "?")
+        local first = letter.items and letter.items[1]
+        table.insert(rows, { mailbox.Contents(letter) .. "  |cff999999- " .. from .. "|r", mailbox.MoneyText(letter),
+            mailbox.ExpiresText(letter), item = first and (first[3] or first[1]) })
+    end
+    if (c.mailHidden or 0) > 0 then
+        table.insert(rows, { "|cff999999" .. format(L["%d more letters the game does not show yet"], c.mailHidden) .. "|r" })
+    end
+    if c.newMail then table.insert(rows, { "|cff80c0ff" .. L["New mail since the last mailbox visit"] .. "|r" }) end
+    return rows
+end
+
 function InfoRows(c, section)
     local rows = {}
+    if section == "mail" then return mailbox.Rows(c) end
     if section == "reps" then
         for _, entry in ipairs(ReputationRows(c)) do
             if entry.header then
@@ -2546,6 +2827,8 @@ local function BuildCharacterPage(page)
 
     local back = MakeButton(page, 100, L["Back"], function() window.ShowTab(window.lastTab or 1) end)
     back:SetPoint("TOPRIGHT", -12, -6)
+    local note = MakeButton(page, 70, L["Note"], function() custom.EditNote(window.detail) end)
+    note:SetPoint("RIGHT", back, "LEFT", -6, 0)
 
     -- secciones como iconos junto al nombre, con borde dorado como los del minimapa
     local function SectionIcon(section)
@@ -2729,7 +3012,7 @@ local function BuildCharacterPage(page)
         { key = "extra", title = "", x = 526, width = 186, justify = "RIGHT" },
     }, -64, ROWS - 1)
     local function InfoSection()
-        if window.section == "items" then return "ah" end
+        if window.section == "items" then return window.filter == "mail" and "mail" or "ah" end
         return window.section
     end
     infoTable.source = function() return InfoRows(window.detail, InfoSection()) end
@@ -2757,6 +3040,8 @@ local function BuildCharacterPage(page)
         infoEmpty:SetShown(#list == 0)
         if InfoSection() == "ah" then
             infoEmpty:SetText(L["Open the auction house with this character to read its auctions."])
+        elseif InfoSection() == "mail" then
+            infoEmpty:SetText(L["Open a mailbox with this character to read its letters."])
         else
             infoEmpty:SetText(L["Log in with this character once to read this."])
         end
@@ -2906,7 +3191,9 @@ local function BuildCharacterPage(page)
         if progress then line = line .. format(" |cff8fb8ff(%d%%)|r", progress * 100) end
         if c.guild then line = line .. "  <" .. c.guild .. ">" end
         if c.zone then line = line .. "  -  " .. c.zone end
+        if c.note then line = line .. "  |cffffd100" .. (#c.note > 60 and (c.note:sub(1, 57) .. "...") or c.note) .. "|r" end
         info:SetText(line)
+        custom.LayoutSections(page, name)
         stats:SetText(format("%s: %s     %s: %s     %s: %s     %s: %s",
             L["Gold"], Money(c.money) .. ((c.mailMoney or 0) > 0 and ("  " .. format(L["(+%s in mail)"], Money(c.mailMoney))) or ""),
             L["Rested"], RestedText(c),
@@ -2915,7 +3202,8 @@ local function BuildCharacterPage(page)
             if btn.key == window.section then btn:LockHighlight() else btn:UnlockHighlight() end
         end
         local itemsShown = window.section == "items"
-        local auctions = itemsShown and window.filter == "ah"
+        -- subastas y correo como lista, no como casillas
+        local auctions = itemsShown and (window.filter == "ah" or window.filter == "mail")
         local talentsShown = window.section == "talents"
         local legacyShown = window.section == "legacy"
         talents:SetShown(talentsShown)
@@ -3135,6 +3423,8 @@ local HELP = {
     "|cffffd100/alts button|r - shows or hides the minimap button",
     "|cffffd100/alts theme <name>|r - changes the colours",
     "|cffffd100/alts scale <0.6-1.6>|r - window size",
+    "|cffffd100/alts mail|r - opens the mail tab",
+    "|cffffd100/alts customize|r - tabs, sections, filters and mail options",
 }
 
 local UpdateMinimapButton
@@ -3154,7 +3444,7 @@ local function BuildOptionsTab(page)
         MakeCheck(page, L[label], key, onChange):SetPoint("TOPLEFT", x, y)
     end
     Check("Minimap button", "button", 16, -32, function() UpdateMinimapButton() end)
-    Check("Warn at login about mail that is about to expire", "mailWarning", 16, -56)
+    Check("Warn about mail that is about to expire", "mailWarning", 16, -56)
     Check("Warn when a profession cooldown is over", "cooldownWarning", 16, -80, CheckCooldowns)
     Check("Warn at login about sold or ended auctions", "auctionWarning", 16, -104)
     Check("Show hidden characters", "showHidden", 16, -128, function() RefreshWindow() end)
@@ -3167,6 +3457,9 @@ local function BuildOptionsTab(page)
     Check("Leave out the current character", "tooltipSkipMe", 400, -56)
     Check("Only the total", "tooltipTotalOnly", 400, -80)
     Check("Where it is only with Shift held", "tooltipShift", 400, -104)
+
+    local more = MakeButton(page, 200, L["Tabs, sections and filters..."], function() window.ShowTab(custom.PAGE) end)
+    more:SetPoint("TOPLEFT", 400, -136)
 
     local sizeLabel = Skin(page:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall"), "text")
     sizeLabel:SetPoint("TOPLEFT", 16, -164)
@@ -3237,7 +3530,8 @@ end
 
 -- marco y pestanas
 
-local TABS = { "Characters", "Professions", "Cooldowns", "Guild", "Search", "Options" }
+local TABS = { "Characters", "Professions", "Cooldowns", "Guild", "Search", "Options", "Mail" }
+for _, name in ipairs(TABS) do OPTIONS["showTab" .. name] = true end
 
 -- ficha y recetas no tienen pestana
 local function ShowTab(index)
@@ -3254,7 +3548,93 @@ local function ShowTab(index)
     RefreshWindow()
 end
 
-local COOLDOWNS_PAGE, GUILD_PAGE, SEARCH_PAGE, OPTIONS_PAGE, CHARACTER_PAGE, RECIPES_PAGE = 3, 4, 5, 6, 7, 8
+local COOLDOWNS_PAGE, GUILD_PAGE, SEARCH_PAGE, OPTIONS_PAGE, CHARACTER_PAGE, RECIPES_PAGE = 3, 4, 5, 6, 8, 9
+mailbox.PAGE, custom.PAGE = 7, 10
+
+-- orden guardado por nombre; las pestanas que falten van al final
+function custom.TabOrder()
+    local order, seen = {}, {}
+    for _, name in ipairs(db.options.tabOrder or {}) do
+        for i, tabName in ipairs(TABS) do
+            if tabName == name and not seen[i] then
+                table.insert(order, i)
+                seen[i] = true
+            end
+        end
+    end
+    for i in ipairs(TABS) do
+        if not seen[i] then table.insert(order, i) end
+    end
+    return order
+end
+
+-- Opciones no se puede quitar: sin ella no se vuelve a esta pagina
+function custom.TabShown(i)
+    return TABS[i] == "Options" or db.options["showTab" .. TABS[i]]
+end
+
+function custom.FirstTab()
+    for _, i in ipairs(custom.TabOrder()) do
+        if custom.TabShown(i) then return i end
+    end
+    return OPTIONS_PAGE
+end
+
+function custom.MoveTab(i, delta)
+    local order = custom.TabOrder()
+    for n, index in ipairs(order) do
+        if index == i and order[n + delta] then
+            order[n], order[n + delta] = order[n + delta], order[n]
+            break
+        end
+    end
+    local names = {}
+    for _, index in ipairs(order) do table.insert(names, TABS[index]) end
+    db.options.tabOrder = names
+    custom.LayoutTabs()
+end
+
+-- el ancho se reparte entre las que se ven
+function custom.LayoutTabs()
+    local shown = {}
+    for _, i in ipairs(custom.TabOrder()) do
+        local tab = window.tabs[i]
+        if custom.TabShown(i) then
+            table.insert(shown, tab)
+        else
+            tab:Hide()
+        end
+    end
+    local step = math.min(116, math.floor(716 / #shown))
+    for n, tab in ipairs(shown) do
+        tab:SetWidth(step - 6)
+        tab:ClearAllPoints()
+        tab:SetPoint("TOPLEFT", 12 + (n - 1) * step, -36)
+        tab:Show()
+    end
+    if window.lastTab and not custom.TabShown(window.lastTab) then window.lastTab = custom.FirstTab() end
+    RefreshWindow()
+end
+
+-- cuantos personajes piden atencion, en la pestana
+function custom.UpdateBadges()
+    local expiring, new, ready, now = 0, 0, 0, time()
+    for _, c in ipairs(SortedChars()) do
+        local state = mailbox.State(c)
+        if state == "expiring" then expiring = expiring + 1 elseif state == "new" then new = new + 1 end
+        for _, at in pairs(c.cooldowns or {}) do
+            if at <= now then ready = ready + 1 end
+        end
+    end
+    local mail = L["Mail"]
+    if expiring > 0 then
+        mail = mail .. format(" |cffff5050(%d)|r", expiring)
+    elseif new > 0 then
+        mail = mail .. format(" |cff80c0ff(%d)|r", new)
+    end
+    window.tabs[mailbox.PAGE]:SetLabel(mail)
+    window.tabs[COOLDOWNS_PAGE]:SetLabel(L["Cooldowns"] .. (ready > 0 and format(" |cff40bf40(%d)|r", ready) or ""))
+end
 
 local function OpenCharacter(c)
     local page = window.pages[CHARACTER_PAGE]
@@ -3276,6 +3656,7 @@ end
 
 function RefreshWindow()
     if not window or not window:IsShown() then return end
+    custom.UpdateBadges()
     local page = window.pages[window.tab]
     if page.Update then page.Update() end
     if page.table then page.table:Refresh() end
@@ -3586,6 +3967,229 @@ function guildBank.BuildPage(page)
     page.table = grid
 end
 
+-- pestana de correo: todas las cartas, la que caduca antes primero
+
+function mailbox.Matches(letter, query)
+    if query == "" then return true end
+    for _, text in ipairs({ letter.from or "", letter.subject or "" }) do
+        if text:lower():find(query, 1, true) then return true end
+    end
+    for _, item in ipairs(letter.items or {}) do
+        if Matches(item[1], query) then return true end
+    end
+    return false
+end
+
+function mailbox.List(query)
+    local list = {}
+    query = strtrim(query or ""):lower()
+    for _, c in ipairs(SortedChars()) do
+        for _, letter in ipairs(c.letters or {}) do
+            if mailbox.Matches(letter, query) then table.insert(list, { c = c, letter = letter }) end
+        end
+        if (c.mailHidden or 0) > 0 and query == "" then table.insert(list, { c = c, hidden = c.mailHidden }) end
+    end
+    table.sort(list, function(a, b)
+        local x, y = a.letter and a.letter.expires or math.huge, b.letter and b.letter.expires or math.huge
+        if x == y then return ByName(a.c) < ByName(b.c) end
+        return x < y
+    end)
+    return list
+end
+
+function mailbox.Fill(cells, entry)
+    cells.name:SetText(ClassIcon(entry.c) .. ClassColored(entry.c))
+    local letter = entry.letter
+    if not letter then
+        cells.what:SetText("|cff999999" .. format(L["%d more letters the game does not show yet"], entry.hidden) .. "|r")
+        return
+    end
+    cells.from:SetText(letter.expected and ("|cff999999" .. (letter.from or "?") .. "|r") or (letter.from or "?"))
+    cells.what:SetText(mailbox.Contents(letter))
+    cells.money:SetText(mailbox.MoneyText(letter))
+    cells.expires:SetText(mailbox.ExpiresText(letter))
+end
+
+mailbox.EXPECTED = {
+    sent     = "Sent by %s; not seen in this mailbox yet.",
+    returned = "Returned by %s; not seen in this mailbox yet.",
+    old      = "Saved by an older version. Open the mailbox to read the letters one by one.",
+}
+
+function mailbox.Tooltip(entry)
+    local c, letter = entry.c, entry.letter
+    GameTooltip:AddLine(ClassColored(c))
+    if not letter then
+        GameTooltip:AddLine(L["The mailbox shows 50 letters at a time. Take or delete letters to see the rest."], 1, 1, 1, true)
+        return
+    end
+    GameTooltip:AddDoubleLine(L["From"], letter.from or "?", 1, 0.82, 0, 1, 1, 1)
+    if letter.subject and letter.subject ~= "" then GameTooltip:AddLine(letter.subject, 1, 1, 1, true) end
+    for _, item in ipairs(letter.items or {}) do
+        local id, count, link = item[1], item[2], item[3]
+        local name = (link and link:match("%[(.-)%]")) or ItemName(id) or ("item:" .. id)
+        GameTooltip:AddDoubleLine(format("|T%s:14:14|t %s", C_Item.GetItemIconByID(id) or 134400, QualityColored(id, name)), "x" .. count, 1, 1, 1, 1, 1, 1)
+    end
+    if (letter.money or 0) > 0 then GameTooltip:AddDoubleLine(L["Gold"], Money(letter.money), 1, 0.82, 0, 1, 1, 1) end
+    if (letter.cod or 0) > 0 then
+        GameTooltip:AddDoubleLine(L["COD"], Money(letter.cod), 1, 0.3, 0.3, 1, 1, 1)
+        GameTooltip:AddLine(L["Not paid in time, it goes back to the sender."], 0.6, 0.6, 0.6, true)
+    end
+    local left = letter.expires - time()
+    GameTooltip:AddLine(left > 0 and format(L["expires in %s"], Duration(left)) or L["expired"], 1, 1, 1)
+    if letter.returned then GameTooltip:AddLine(L["Returned: deleted when it expires."], 1, 0.6, 0.2, true) end
+    if letter.expected == "auction" then
+        if letter.estimate then
+            GameTooltip:AddLine(L["From a sold auction; the gold is an estimate after the auction house cut."], 0.6, 0.6, 0.6, true)
+        else
+            GameTooltip:AddLine(L["From an auction that ended: the item comes back, or the gold if it sold."], 0.6, 0.6, 0.6, true)
+        end
+    elseif letter.expected then
+        GameTooltip:AddLine(format(L[mailbox.EXPECTED[letter.expected]], letter.from or "?"), 0.6, 0.6, 0.6, true)
+    end
+    if c.mailSeen then GameTooltip:AddLine(format(L["Mailbox seen %s ago"], Duration(time() - c.mailSeen)), 0.6, 0.6, 0.6) end
+    GameTooltip:AddLine(" ")
+    GameTooltip:AddLine(L["Left click: open the character"], 0.6, 0.6, 0.6)
+end
+
+function mailbox.BuildPage(page)
+    local search = CreateFrame("EditBox", nil, page, "InputBoxTemplate")
+    search:SetSize(240, 20)
+    search:SetPoint("TOPLEFT", 22, -6)
+    search:SetAutoFocus(false)
+    search:SetScript("OnEscapePressed", search.ClearFocus)
+    search:SetScript("OnEnterPressed", search.ClearFocus)
+    local hint = Skin(page:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall"), "dim")
+    hint:SetPoint("LEFT", search, "RIGHT", 12, 0)
+    hint:SetText(L["Sender, subject or item"])
+
+    local list = MakeTable(page, {
+        { key = "name",    title = "Character", x = 4,   width = 130, sort = function(e) return ByName(e.c) end },
+        { key = "from",    title = "From",      x = 138, width = 110, sort = function(e) return (e.letter and e.letter.from or ""):lower() end },
+        { key = "what",    title = "Contents",  x = 252, width = 270 },
+        { key = "money",   title = "Gold",      x = 526, width = 100, justify = "RIGHT",
+          sort = function(e) return e.letter and math.max(e.letter.money or 0, e.letter.cod or 0) or 0 end, desc = true },
+        { key = "expires", title = "Expires",   x = 630, width = 82, justify = "RIGHT",
+          sort = function(e) return e.letter and e.letter.expires or math.huge end },
+    }, -34, ROWS - 1)
+    list.id = "mail"
+    list.source = function() return mailbox.List(search:GetText()) end
+    list.fill = mailbox.Fill
+    list.onEnter = mailbox.Tooltip
+    list.onClick = function(entry, mouse)
+        if mouse ~= "LeftButton" then return end
+        OpenCharacter(entry.c)
+        window.filter = "mail"
+        RefreshWindow()
+    end
+    search:SetScript("OnTextChanged", function()
+        list.offset = 0
+        list:Refresh()
+    end)
+
+    local empty = Skin(page:CreateFontString(nil, "OVERLAY", "GameFontNormal"), "dim")
+    empty:SetPoint("TOP", 0, -140)
+    empty:SetWidth(520)
+    empty:SetText(L["No mail yet. Open a mailbox with each character to read its letters."])
+    local footer = Skin(page:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall"), "dim")
+    footer:SetPoint("BOTTOMLEFT", 16, 14)
+    list.after = function(entries)
+        local letters, money, owners = 0, 0, {}
+        for _, entry in ipairs(entries) do
+            if entry.letter then
+                letters = letters + 1
+                money = money + (entry.letter.money or 0)
+                owners[entry.c] = true
+            end
+        end
+        local count = 0
+        for _ in pairs(owners) do count = count + 1 end
+        empty:SetShown(#entries == 0 and strtrim(search:GetText() or "") == "")
+        footer:SetText(format(L["%d letters on %d characters, %s in mail"], letters, count, Money(money))
+            .. "    |cff999999~ " .. L["expected, not seen in the mailbox yet"] .. "|r")
+    end
+    page.table = list
+end
+
+-- filtros de reino y faccion bajo la lista de personajes
+function custom.BuildFilters(page)
+    local function Toggle(key, x, labels)
+        local btn
+        btn = MakeButton(page, 150, "", function()
+            db.options[key] = not db.options[key]
+            RefreshWindow()
+        end)
+        btn:SetPoint("BOTTOMLEFT", x, 34)
+        btn.Update = function() btn:SetLabel(L[labels[db.options[key] and 2 or 1]]) end
+        return btn
+    end
+    local realm = Toggle("onlyRealm", 16, { "Realm: all", "Realm: this one" })
+    local faction = Toggle("onlyFaction", 172, { "Faction: both", "Faction: this one" })
+    page.Update = function()
+        realm.Update()
+        faction.Update()
+    end
+end
+
+-- pagina sin pestana, desde Opciones
+function custom.BuildPage(page)
+    local function Header(text, x, y)
+        local header = forever.Display(Skin(page:CreateFontString(nil, "OVERLAY", "GameFontNormal"), "header"), 17)
+        header:SetPoint("TOPLEFT", x, y)
+        header:SetText(L[text])
+    end
+    local back = MakeButton(page, 100, L["Back"], function() window.ShowTab(OPTIONS_PAGE) end)
+    back:SetPoint("TOPRIGHT", -12, -6)
+
+    Header("Tabs", 16, -8)
+    local rows = {}
+    for i, name in ipairs(TABS) do
+        local row = CreateFrame("Frame", nil, page)
+        row:SetSize(330, 24)
+        local up = MakeButton(row, 22, "^", function() custom.MoveTab(i, -1) end)
+        up:SetPoint("LEFT")
+        local down = MakeButton(row, 22, "v", function() custom.MoveTab(i, 1) end)
+        down:SetPoint("LEFT", up, "RIGHT", 4, 0)
+        if name == "Options" then
+            local label = Skin(row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall"), "dim")
+            label:SetPoint("LEFT", down, "RIGHT", 10, 0)
+            label:SetText(L["Options"] .. " " .. L["(always shown)"])
+        else
+            MakeCheck(row, L[name], "showTab" .. name, custom.LayoutTabs):SetPoint("LEFT", down, "RIGHT", 10, 0)
+        end
+        rows[i] = row
+    end
+
+    local function Check(label, key, x, y, onChange)
+        MakeCheck(page, L[label], key, onChange):SetPoint("TOPLEFT", x, y)
+    end
+    Header("Character page", 400, -8)
+    for i = 2, #SECTIONS do
+        Check(SECTIONS[i][2], "showSection" .. SECTIONS[i][1], 400, -32 - (i - 2) * 22, RefreshWindow)
+    end
+
+    Header("Mail", 16, -232)
+    Check("Letter icon in the character list", "mailMarker", 16, -256, RefreshWindow)
+    Check("Expect mail from ended auctions", "mailFromAuctions", 16, -280, mailbox.Tick)
+    Check("Warn about mail that is about to expire", "mailWarning", 16, -304)
+
+    Header("Characters", 400, -232)
+    Check("Only characters on this realm", "onlyRealm", 400, -256, RefreshWindow)
+    Check("Only characters of this faction", "onlyFaction", 400, -280, RefreshWindow)
+    local note = Skin(page:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall"), "dim")
+    note:SetPoint("TOPLEFT", 400, -306)
+    note:SetWidth(320)
+    note:SetJustifyH("LEFT")
+    note:SetText(L["The filters also apply to tooltips and search. Characters saved before this version need one login to record their faction."])
+
+    page.Update = function()
+        for n, i in ipairs(custom.TabOrder()) do
+            rows[i]:ClearAllPoints()
+            rows[i]:SetPoint("TOPLEFT", 16, -32 - (n - 1) * 26)
+        end
+    end
+end
+
 local function BuildWindow()
     window = CreateFrame("Frame", "AltersForeverWindow", UIParent)
     window:SetSize(740, 106 + 18 + ROWS * ROW_HEIGHT + 30)
@@ -3707,11 +4311,10 @@ local function BuildWindow()
 
     window.tabs, window.pages = {}, {}
     window.ShowTab = ShowTab
-    for i = 1, RECIPES_PAGE do
+    -- custom.LayoutTabs las coloca segun el orden elegido
+    for i = 1, custom.PAGE do
         if TABS[i] then
-            local tab = MakeButton(window, 110, L[TABS[i]], function() ShowTab(i) end)
-            tab:SetPoint("TOPLEFT", 12 + (i - 1) * 116, -36)
-            window.tabs[i] = tab
+            window.tabs[i] = MakeButton(window, 110, L[TABS[i]], function() ShowTab(i) end)
         end
 
         local page = CreateFrame("Frame", nil, window)
@@ -3736,7 +4339,9 @@ local function BuildWindow()
     chars.fill = FillCharacter
     chars.onEnter = CharacterTooltip
     chars.onClick = function(c, mouse)
-        if mouse == "RightButton" then
+        if mouse == "RightButton" and IsShiftKeyDown() then
+            custom.EditNote(c)
+        elseif mouse == "RightButton" then
             for guid, other in pairs(db.chars) do
                 if other == c then
                     local key = (c.hidden and "ALTERSFOREVER_SHOW" or "ALTERSFOREVER_HIDE") .. (c == me and "_ME" or "")
@@ -3785,6 +4390,7 @@ local function BuildWindow()
     end)
     totalHover:SetScript("OnLeave", function() GameTooltip:Hide() end)
     window.pages[1].table = chars
+    custom.BuildFilters(window.pages[1])
 
     -- profesiones
     local profs = MakeTable(window.pages[2], {
@@ -3892,8 +4498,11 @@ local function BuildWindow()
     window.pages[COOLDOWNS_PAGE].table = cooldowns
     BuildCharacterPage(window.pages[CHARACTER_PAGE])
     BuildRecipesPage(window.pages[RECIPES_PAGE])
+    mailbox.BuildPage(window.pages[mailbox.PAGE])
+    custom.BuildPage(window.pages[custom.PAGE])
 
-    ShowTab(1)
+    custom.LayoutTabs()
+    ShowTab(custom.FirstTab())
 end
 
 local function ToggleWindow()
@@ -3933,6 +4542,32 @@ local function FollowCursor()
     PlaceMinimapButton()
 end
 
+-- lo que pide atencion, de un vistazo
+function custom.Summary(tooltip)
+    local expiring, new, ready, money, now = {}, {}, {}, 0, time()
+    local list = SortedChars()
+    for _, c in ipairs(list) do
+        money = money + (c.money or 0)
+        local state, left = mailbox.State(c)
+        if state == "expiring" then
+            table.insert(expiring, format("%s (%s)", ClassColored(c), left > 0 and Duration(left) or L["expired"]))
+        elseif state == "new" then
+            table.insert(new, ClassColored(c))
+        end
+        for _, at in pairs(c.cooldowns or {}) do
+            if at <= now then
+                table.insert(ready, ClassColored(c))
+                break
+            end
+        end
+    end
+    tooltip:AddDoubleLine(format(L["%d characters"], #list), Money(money), 1, 1, 1, 1, 1, 1)
+    if #expiring > 0 then tooltip:AddLine(format(L["Mail about to expire: %s"], table.concat(expiring, ", ")), 1, 0.4, 0.4, true) end
+    if #new > 0 then tooltip:AddLine(format(L["New mail: %s"], table.concat(new, ", ")), 0.5, 0.75, 1, true) end
+    if #ready > 0 then tooltip:AddLine(format(L["Cooldowns ready: %s"], table.concat(ready, ", ")), 0.4, 0.85, 0.4, true) end
+    tooltip:AddLine(" ")
+end
+
 local function BuildMinimapButton()
     minimapButton = CreateFrame("Button", "AltersForeverMinimapButton", Minimap)
     minimapButton:SetSize(31, 31)
@@ -3968,6 +4603,7 @@ local function BuildMinimapButton()
     minimapButton:SetScript("OnEnter", function(self)
         GameTooltip:SetOwner(self, "ANCHOR_LEFT")
         GameTooltip:AddLine("Alters Forever", theme.title[1], theme.title[2], theme.title[3])
+        custom.Summary(GameTooltip)
         GameTooltip:AddLine(L["Click: open the window"], 1, 1, 1)
         GameTooltip:AddLine(L["Drag: move the button"], 0.8, 0.8, 0.8)
         GameTooltip:Show()
@@ -3985,6 +4621,10 @@ local function HandleSlash(msg)
 
     if command == "" then
         ToggleWindow()
+    elseif command == "mail" or command == "customize" then
+        if not window then BuildWindow() end
+        window:Show()
+        window.ShowTab(command == "mail" and mailbox.PAGE or custom.PAGE)
     elseif command == "tooltip" then
         db.options.tooltip = not db.options.tooltip
         Say(db.options.tooltip and "item tooltips: on." or "item tooltips: off.")
@@ -4122,15 +4762,24 @@ function events.AUCTION_HOUSE_AUCTION_CREATED() pcall(C_AuctionHouse.QueryOwnedA
 function events.OWNED_AUCTIONS_UPDATED() ScanAuctions() end
 function events.BIDS_UPDATED() ScanBids() end
 function events.MAIL_SEND_SUCCESS()
+    local outgoing = mailbox.outgoing
     if outgoing then
-        Deliver(outgoing.c, outgoing.items, outgoing.money)
-        outgoing = nil
+        mailbox.Deliver(outgoing.c, outgoing.letter)
+        mailbox.outgoing = nil
     end
 end
-function events.MAIL_FAILED() outgoing = nil end
-function events.MAIL_CLOSED() mailOpen = false end
+function events.MAIL_FAILED() mailbox.outgoing = nil end
+function events.MAIL_CLOSED()
+    mailOpen = false
+    mailbox.closedAt = time()
+end
 function events.MAIL_INBOX_UPDATE()
     if mailOpen then ScanMail() end
+end
+-- tambien al entrar, si hay correo sin leer; al cerrar el buzon llega por las cartas que quedan sin abrir
+function events.UPDATE_PENDING_MAIL()
+    if mailOpen or (mailbox.closedAt and time() - mailbox.closedAt < 10) then return end
+    if HasNewMail and HasNewMail() then me.newMail = true end
 end
 
 function events.TIME_PLAYED_MSG(total)
@@ -4201,6 +4850,9 @@ loader:SetScript("OnEvent", function(self, event, ...)
     if (db.version or 0) < 2 then
         for _, c in pairs(db.chars) do ForgetFakeCooldowns(c) end
     end
+    if (db.version or 0) < 3 then
+        for _, c in pairs(db.chars) do mailbox.Upgrade(c) end
+    end
     db.version = DATA_VERSION
 
     -- por GUID: en Forever el nombre llega tarde y sin reino
@@ -4229,7 +4881,7 @@ loader:SetScript("OnEvent", function(self, event, ...)
     end
 
     HookTooltips()
-    WatchMail()
+    mailbox.Watch()
     BuildMinimapButton()
 
     for name in pairs(events) do
@@ -4237,7 +4889,7 @@ loader:SetScript("OnEvent", function(self, event, ...)
     end
     C_Timer.After(5, AskPlayed)
     C_Timer.After(3, ScanWorn)
-    C_Timer.After(8, WarnMail)
+    C_Timer.After(8, mailbox.Tick)
     C_Timer.After(9, WarnAuctions)
     C_Timer.After(10, CheckCooldowns)
     C_Timer.After(11, AskLockouts)
@@ -4246,6 +4898,8 @@ loader:SetScript("OnEvent", function(self, event, ...)
         C_Timer.After(2 + i, function() RunScan(scan) end)
     end
     C_Timer.NewTicker(60, CheckCooldowns)
+    -- subastas acabadas y correo a punto de caducar, tambien durante la sesion
+    C_Timer.NewTicker(60, mailbox.Tick)
 
     SLASH_ALTERSFOREVER1 = "/alts"
     SLASH_ALTERSFOREVER2 = "/af"
