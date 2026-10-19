@@ -194,7 +194,7 @@ SlashCmdList = {}
 
 -- load the addon
 local ns = {}
-for _, file in ipairs({ "Locales.lua", "Themes.lua", "AltersForever.lua" }) do
+for _, file in ipairs({ "Locales.lua", "Themes.lua", "AltersForever.lua", "Mail.lua", "Customize.lua" }) do
     local fh = assert(io.open(ADDON_DIR .. "/" .. file))
     local chunk = assert(loadstring(fh:read("*a"), "@" .. file))
     fh:close()

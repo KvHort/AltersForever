@@ -90,7 +90,9 @@ things:
 - compiles every file with Lua 5.1, which has the same limits as the game:
   200 locals in the main chunk and 60 upvalues in each function. The main
   file is close to the first limit, so new code goes into tables such as
-  `mailbox`, `custom` or `guildBank` instead of new top-level locals;
+  `mailbox`, `custom` or `guildBank` instead of new top-level locals, or
+  into its own file. `Mail.lua` and `Customize.lua` load after the main file
+  and get its helpers from `ns.af`, and `db`, `me` and `window` from `ns`;
 - runs luacheck with `.luacheckrc`. An unknown global is usually a typo or a
   local used before its definition. Add a WoW API name to the list only when
   the code needs it;
