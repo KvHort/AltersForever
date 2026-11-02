@@ -40,6 +40,8 @@ local DATA_VERSION = 3
 local mailbox = { DAYS = 30, COD_DAYS = 3, WARNING_DAYS = 3, AH_CUT = 0.05, warned = {} }
 -- pestanas, secciones, filtros, notas y resumen, en Customize.lua
 local custom = {}
+-- busqueda con filtros (boe, epic, >50, & | !), en Search.lua
+local itemSearch = ns.search
 
 local MIN_SCALE, MAX_SCALE = 0.6, 1.6
 
@@ -1176,6 +1178,7 @@ local function ItemName(id)
     end
     return name
 end
+itemSearch.ItemName = ItemName
 
 local PLACES = {
     { "bags", "bags" },
@@ -1823,11 +1826,13 @@ local function SearchResults(query)
     local results = {}
     query = strtrim(query or ""):lower()
     if #query < 2 then return results end
+    local test = itemSearch.Compile(query)
+    if not test then return results end
     local found = {}
     local function Add(owner, items)
         for id, count in pairs(items or {}) do
             local name = ItemName(id)
-            if name and name:lower():find(query, 1, true) then
+            if name and test(id) == true then
                 local entry = found[id]
                 if not entry then
                     entry = { id = id, name = name, total = 0, owners = {}, order = {} }
@@ -1901,9 +1906,7 @@ local PLACE_ICONS = {
 }
 
 local function Matches(id, query)
-    if query == "" then return true end
-    local name = ItemName(id) or ""
-    return name:lower():find(query, 1, true) ~= nil
+    return itemSearch.Matches(id, query)
 end
 
 -- una bolsa tal como esta, con sus huecos
@@ -2622,7 +2625,7 @@ local function BuildCharacterPage(page)
                 local id = tonumber(link:match("item:(%d+)"))
                 local name = link:match("%[(.-)%]") or (id and ItemName(id)) or ""
                 if slot.name then slot.name:SetText(id and QualityColored(id, name) or name) end
-                if query ~= "" and not name:lower():find(query, 1, true) then alpha = 0.25 end
+                if query ~= "" and not (id and Matches(id, query) or name:lower():find(query, 1, true)) then alpha = 0.25 end
             else
                 slot.item, slot.empty = nil, slot.label
                 slot.icon:SetTexture(slot.background)
@@ -3769,7 +3772,7 @@ local function BuildWindow()
     search:SetScript("OnEnterPressed", search.ClearFocus)
     local hint = Skin(window.pages[SEARCH_PAGE]:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall"), "dim")
     hint:SetPoint("LEFT", search, "RIGHT", 12, 0)
-    hint:SetText(L["Type part of an item name"])
+    hint:SetText(L["Name, or #filter: #boe #epic #head, >50, 10-20.  & and, | or, ! not"])
 
     local found = MakeTable(window.pages[SEARCH_PAGE], {
         { key = "item",  title = "Item",       x = 4,   width = 300, sort = function(e) return e.name:lower() end },
@@ -4101,7 +4104,16 @@ function events.TIME_PLAYED_MSG(total)
     wipe(muted)
 end
 
-function events.GET_ITEM_INFO_RECEIVED() end
+-- una busqueda pidio un objeto que el cliente no tenia: se repite al llegar, una vez por tanda
+function events.GET_ITEM_INFO_RECEIVED(_, success)
+    if success == false or not itemSearch.waiting or itemSearch.refreshing then return end
+    itemSearch.refreshing = true
+    C_Timer.After(0.3, function()
+        itemSearch.refreshing = nil
+        itemSearch.waiting = false
+        RefreshWindow()
+    end)
+end
 
 function events.PLAYER_LOGOUT()
     if me.playedAt then
@@ -4227,7 +4239,7 @@ ns.mailbox, ns.custom = mailbox, custom
 ns.af = {
     L = L, Say = Say, Money = Money, Duration = Duration, ClassColored = ClassColored, ClassIcon = ClassIcon,
     SortedChars = SortedChars, ByName = ByName, Remember = Remember, ItemName = ItemName,
-    QualityColored = QualityColored, Matches = Matches, Skin = Skin, forever = forever,
+    QualityColored = QualityColored, Matches = Matches, SearchResults = SearchResults, Skin = Skin, forever = forever,
     MakeButton = MakeButton, MakeCheck = MakeCheck, MakeTable = MakeTable,
     RefreshWindow = RefreshWindow, OpenCharacter = OpenCharacter,
     TABS = TABS, SECTIONS = SECTIONS, ROWS = ROWS, COOLDOWNS_PAGE = COOLDOWNS_PAGE, OPTIONS_PAGE = OPTIONS_PAGE,

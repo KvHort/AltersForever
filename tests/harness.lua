@@ -194,7 +194,13 @@ SlashCmdList = {}
 
 -- load the addon
 local ns = {}
-for _, file in ipairs({ "Locales.lua", "Themes.lua", "AltersForever.lua", "Mail.lua", "Customize.lua" }) do
+-- the files in .toc order
+local files = {}
+for line in io.lines(ADDON_DIR .. "/AltersForever.toc") do
+    local file = line:match("^%s*([^#%s][^%s]*%.lua)%s*$")
+    if file then table.insert(files, file) end
+end
+for _, file in ipairs(files) do
     local fh = assert(io.open(ADDON_DIR .. "/" .. file))
     local chunk = assert(loadstring(fh:read("*a"), "@" .. file))
     fh:close()
@@ -386,6 +392,122 @@ dialog.editBox = NewWidget("EditBox")
 dialog.editBox._text = "  Bank alt  "
 StaticPopupDialogs.ALTERSFOREVER_NOTE.OnAccept(dialog, beta)
 Check(beta.note == "Bank alt", "note saved and trimmed")
+
+-- search with filters (Search.lua)
+local search = ns.search
+-- name, link, quality, item level, required level, type, subtype, stack, equip slot, ..., bind type
+local itemData = {
+    [2589] = { "Linen Cloth", 1, 5, "Trade Goods", "Cloth", "" },
+    [7001] = { "Copper Helm", 2, 12, "Armor", "Mail", "INVTYPE_HEAD", 2 },
+    [7002] = { "Silver Band", 3, 30, "Armor", "Miscellaneous", "INVTYPE_FINGER", 1 },
+    [7003] = { "Dragon Blade", 4, 60, "Weapon", "Two-Handed Swords", "INVTYPE_2HWEAPON", 1 },
+    [7004] = { "Cloth Robe", 2, 25, "Armor", "Cloth", "INVTYPE_ROBE", 2 },
+    [7005] = { "Minor Healing Potion", 1, 5, "Consumable", "Potion", "INVTYPE_NON_EQUIP_IGNORE" },
+}
+local loaded = { [2589] = true, [7001] = true, [7002] = true, [7003] = true, [7004] = true, [7005] = true }
+C_Item.GetItemInfo = function(id)
+    local d = itemData[id]
+    if not d or not loaded[id] then return nil end
+    return d[1], "|Hitem:" .. id .. "|h[" .. d[1] .. "]|h", d[2], d[3], 1, d[4], d[5], 20, d[6], 134400, 0, 0, 0, d[7] or 0
+end
+for id, d in pairs(itemData) do db.names[id] = d[1] end
+local function Found(query)
+    local ids = {}
+    for id in pairs(itemData) do if search.Matches(id, query) then ids[#ids + 1] = id end end
+    table.sort(ids)
+    return table.concat(ids, ",")
+end
+Check(Found("") == "2589,7001,7002,7003,7004,7005", "empty search matches every item")
+Check(Found("LINEN") == "2589", "name search ignores case")
+Check(Found("cloth") == "2589,7004", "cloth: a plain word is the name only (" .. Found("cloth") .. ")")
+Check(Found("linen cloth") == "2589", "a plain word never matches a keyword")
+Check(Found("armor") == "", "armor without # is a name")
+Check(Found("#cloth") == "2589,7004", "#cloth: the cloth subtype, trade goods and armour")
+Check(Found("#cloth armor") == "7004" and Found("#cloth & #armor") == "7004", "#cloth armor: cloth armour only")
+Check(Found("#trade goods") == "2589", "#: a type of two words")
+Check(Found("#") == Found(""), "# alone matches everything")
+Check(Found("#boe") == "7001,7004" and Found("boe") == "", "#boe keyword, boe alone is a name")
+Check(Found("#bop") == "7002,7003", "bop keyword")
+Check(Found("#head") == "7001", "head slot")
+Check(Found("#ring") == "7002", "#ring is the finger slot")
+Check(Found("#chest") == "7004", "a robe is a chest item")
+Check(Found("#epic") == "7003" and Found("#purple") == "7003", "quality by name and by colour")
+Check(Found("#potion") == "7005" and Found("# Potion") == "7005", "consumable subtype")
+Check(Found("#gear") == "7001,7002,7003,7004", "gear: everything that can be equipped")
+Check(Found(">25") == "7002,7003", "item level above 25")
+Check(Found("<=12") == "2589,7001,7005", "item level 12 or less")
+Check(Found("20-30") == "7002,7004" and Found("30-20") == "7002,7004", "item level range, either order")
+Check(Found("=60") == "7003", "exact item level")
+Check(Found("#armor & #boe") == "7001,7004", "and")
+Check(Found("#epic | #potion") == "7003,7005", "or")
+Check(Found("#gear & !#boe") == "7002,7003", "not")
+Check(Found("#boe & >20 | #potion") == "7004,7005", "& binds tighter than |")
+Check(Found("!!#boe") == "7001,7004", "two nots cancel")
+Check(Found(" & | ") == "2589,7001,7002,7003,7004,7005", "only operators: matches everything")
+
+-- an item the client does not have yet: no match, then a refresh when it arrives
+loaded[7003] = nil
+itemData[7006] = { "Unknown Axe", 4, 55, "Weapon", "Axes", "INVTYPE_WEAPON", 2 }
+db.names[7006] = "Unknown Axe"
+search.waiting = false
+Check(not search.Matches(7006, "#epic"), "an item without data does not match a keyword")
+Check(search.Matches(7006, "axe"), "but it matches by its saved name")
+Check(search.waiting, "the missing item is noted")
+timers = {}
+Fire("GET_ITEM_INFO_RECEIVED", 7006)
+Fire("GET_ITEM_INFO_RECEIVED", 7006)
+Check(#timers == 1, "one refresh for a burst of item data")
+loaded[7006] = true
+RunTimers()
+Check(not search.waiting, "refresh clears the wait")
+Check(search.Matches(7006, "#epic & >50"), "the item matches once its data is there")
+Fire("GET_ITEM_INFO_RECEIVED", 7006)
+Check(#timers == 0, "no refresh when no search is waiting")
+Check(search.Matches(7003, "#epic"), "an item already known keeps its data")
+loaded[7006] = nil
+itemData[7007] = { "Lost Ring", 3, 40, "Armor", "Miscellaneous", "INVTYPE_FINGER", 1 }
+db.names[7007] = "Lost Ring"
+Check(not search.Matches(7007, "!#epic"), "an item without data does not match a negated filter")
+Check(not search.Matches(7007, ">10 | !#boe"), "nor an or of filters it cannot check")
+Check(search.Matches(7007, "lost | !#boe"), "but its name still matches in an or")
+Check(not search.Matches(7007, "!lost"), "a negated name excludes it without data")
+Check(search.Matches(7007, "!axe"), "a negated name works without data")
+search.waiting = false
+search.Matches(7007, "ring")
+Check(not search.waiting, "a name search does not ask for item data")
+-- an item that never loads stops asking for refreshes
+search.waiting = false
+for _ = 1, 5 do search.Matches(7008, "#epic") end
+search.waiting = false
+search.Matches(7008, "#epic")
+Check(not search.waiting, "an item that never loads stops asking for a refresh")
+search.waiting = true
+timers = {}
+Fire("GET_ITEM_INFO_RECEIVED", 7008, false)
+Check(#timers == 0, "a failed item answer gives no refresh")
+search.waiting = false
+
+-- the Search tab and the mail tab use it
+me.bags = { [7001] = 1, [7002] = 1, [2589] = 20 }
+beta.bank = { [7004] = 1 }
+local function SearchTab(query)
+    local list = {}
+    for _, e in ipairs(ns.af.SearchResults(query)) do list[#list + 1] = e.name .. "=" .. e.total end
+    return table.concat(list, ",")
+end
+Check(SearchTab("#boe") == "Cloth Robe=1,Copper Helm=1", "Search tab: #boe over every character (" .. SearchTab("#boe") .. ")")
+Check(SearchTab("cloth & !#gear") == "Linen Cloth=20", "Search tab: a filter with not")
+Check(SearchTab("l") == "", "Search tab: one letter is too short")
+window.ShowTab(5)
+print("pass  Search tab opens with the new hint")
+local mailbox = ns.mailbox
+me.letters = { { from = "Boe Smith", subject = "hello", expires = now + 999, items = { { 2589, 1 } } } }
+Check(mailbox.Matches(me.letters[1], "boe"), "mail: a plain word still finds the sender")
+Check(not mailbox.Matches(me.letters[1], "#boe"), "mail: a filter looks at the items, not the sender")
+Check(mailbox.Matches(me.letters[1], "cloth & <10"), "mail: a filter finds the letter by its item")
+me.letters[1].subject = "thanks!"
+Check(mailbox.Matches(me.letters[1], "thanks!"), "mail: a ! inside a word is not a filter")
+Check(not search.Matches(7005, "#gear") and not search.Matches(7005, "#non-equippable"), "a non-equippable item is not gear")
 
 print("---- chat")
 for _, m in ipairs(log) do print(m) end

@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Search filters, in the Search tab, on the character page and in the Mail and Guild tabs. A plain word is the name only. `#` before a word makes it a filter: type and subtype (`#armor`, `#potion`, `#cloth armor`), slot (`#head`, `#ring`), quality (`#epic`, `#green`, `#junk`), binding (`#boe`, `#bop`) and `#gear`. Item level needs no `#`: `>50`, `<=20`, `10-20`. Join them with `&` and `|`, and turn one around with `!`.
+- Items the game has not loaded yet show up in the results when their data arrives.
+- In the Mail tab, a filter (`#`, `&`, `|`, a leading `!` or an item level) looks at the items in the letters, not at the sender or subject.
+- New file `Search.lua`. The test harness loads the files in `.toc` order.
+
 ## 1.34
 
 - Mail tab: every letter of every character, the one that expires first at the top, with who sent it, what it carries, its gold or cash on delivery, and when it expires. Search by sender, subject or item. Click a letter to open the character's mail.

@@ -28,6 +28,20 @@ The Guild tab shows the guild bank tab by tab, slot for slot as it is in the
 game, with its gold. It is read when you open the guild bank with any
 character in the guild, and item tooltips and Search count it too.
 
+Search finds an item on every character and in the guild banks. A plain word
+looks at the name only, so `cloth` finds Linen Cloth but not cloth armour.
+Put `#` before a word to use a filter instead: a type or subtype (`#armor`,
+`#potion`), both together (`#cloth armor`), a slot (`#head`, `#ring`,
+`#two-hand`), a quality (`#epic`, `#green`, `#junk`), how it binds (`#boe`,
+`#bop`), or `#gear` for anything you can wear. `#cloth` alone also finds Linen
+Cloth, because the game calls cloth a "Cloth" trade good. Item levels need no
+`#`: `>50`, `<=20`, `=60`, `10-20`. Join terms with `&` (and) and `|` (or),
+and put `!` before one to turn it around: `#armor & #boe & !#cloth`. `&` goes
+before `|`. The same search works on the character page and in the Mail and
+Guild tabs. An item the game has not loaded
+yet matches only by its name, and a `!` filter skips it, until its data
+arrives. Then the list updates.
+
 Professions shows the ranks of every character side by side. Click one to see
 its recipes, coloured by how likely they are to give a skill-up, with their
 materials and how many of them that character has. You can search recipes by
@@ -91,13 +105,15 @@ things:
   200 locals in the main chunk and 60 upvalues in each function. The main
   file is close to the first limit, so new code goes into tables such as
   `mailbox`, `custom` or `guildBank` instead of new top-level locals, or
-  into its own file. `Mail.lua` and `Customize.lua` load after the main file
+  into its own file. `Search.lua` loads before the main file and puts its
+  table in `ns.search`. `Mail.lua` and `Customize.lua` load after the main file
   and get its helpers from `ns.af`, and `db`, `me` and `window` from `ns`;
 - runs luacheck with `.luacheckrc`. An unknown global is usually a typo or a
   local used before its definition. Add a WoW API name to the list only when
   the code needs it;
 - runs `tests/harness.lua`, which loads the addon against a mocked game API
-  and goes through login, the mailbox, sent mail, auctions and every tab.
+  and goes through login, the mailbox, sent mail, auctions, search filters and every
+  tab. It loads the files in `.toc` order.
 
 The harness does not replace a test in the game.
 

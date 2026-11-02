@@ -298,8 +298,11 @@ end
 
 function mailbox.Matches(letter, query)
     if query == "" then return true end
-    for _, text in ipairs({ letter.from or "", letter.subject or "" }) do
-        if text:lower():find(query, 1, true) then return true end
+    -- remitente y asunto solo con un nombre; un filtro (boe, >50, !x) mira los objetos
+    if not ns.search.IsFilter(query) then
+        for _, text in ipairs({ letter.from or "", letter.subject or "" }) do
+            if text:lower():find(query, 1, true) then return true end
+        end
     end
     for _, item in ipairs(letter.items or {}) do
         if Matches(item[1], query) then return true end

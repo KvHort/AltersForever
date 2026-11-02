@@ -18,6 +18,7 @@
 
 Locales.lua
 Themes.lua
+Search.lua
 AltersForever.lua
 Mail.lua
 Customize.lua
